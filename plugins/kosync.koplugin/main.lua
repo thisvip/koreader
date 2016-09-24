@@ -2,7 +2,6 @@ local InputContainer = require("ui/widget/container/inputcontainer")
 local LoginDialog = require("ui/widget/logindialog")
 local InfoMessage = require("ui/widget/infomessage")
 local ConfirmBox = require("ui/widget/confirmbox")
-local DocSettings = require("docsettings")
 local NetworkMgr = require("ui/network/manager")
 local UIManager = require("ui/uimanager")
 local Screen = require("device").screen
@@ -22,6 +21,21 @@ end
 local KOSync = InputContainer:new{
     name = "kosync",
     title = _("Register/login to KOReader server"),
+
+    page_update_times = 0,
+    last_page = -1,
+    last_page_turn_ticks = 0,
+}
+
+local SYNC_STRATEGY = {
+    -- Forward and backward whisper sync settings are using different
+    -- default value, so none of following opinions should be zero.
+    PROMPT = 1,
+    WHISPER = 2,
+    DISABLE = 3,
+
+    DEFAULT_FORWARD = 1,
+    DEFAULT_BACKWARD = 3,
 }
 
 function KOSync:init()
@@ -30,12 +44,15 @@ function KOSync:init()
     self.kosync_username = settings.username
     self.kosync_userkey = settings.userkey
     self.kosync_auto_sync = not (settings.auto_sync == false)
+    self.kosync_whisper_forward = settings.whisper_forward or SYNC_STRATEGY.DEFAULT_FORWARD
+    self.kosync_whisper_backward = settings.whisper_backward or SYNC_STRATEGY.DEFAULT_BACKWARD
     self.kosync_device_id = G_reader_settings:readSetting("device_id")
     --assert(self.kosync_device_id)
     self.ui:registerPostInitCallback(function()
         if self.kosync_auto_sync then
-            UIManager:scheduleIn(1, function() self:getProgress() end)
+            self:_onResume()
         end
+        self:registerEvents()
     end)
     self.ui.menu:registerToMainMenu(self)
     -- Make sure checksum has been calculated at the very first time a document has been opened, to
@@ -64,6 +81,7 @@ function KOSync:addToMainMenu(tab_item_table)
                 checked_func = function() return self.kosync_auto_sync end,
                 callback = function()
                     self.kosync_auto_sync = not self.kosync_auto_sync
+                    self:registerEvents()
                     if self.kosync_auto_sync then
                         -- since we will update the progress when closing document, we should pull
                         -- current progress now to avoid to overwrite it silently.
@@ -74,6 +92,74 @@ function KOSync:addToMainMenu(tab_item_table)
                         self:updateProgress(true)
                     end
                 end,
+            },
+            {
+                text = _("Whisper sync"),
+                enabled_func = function() return self.kosync_auto_sync end,
+                sub_item_table = {
+                    {
+                        text = "Sync to latest record >>>>",
+                        enabled = false,
+                    },
+                    {
+                        text = _("  Auto sync to latest record"),
+                        checked_func = function()
+                            return self.kosync_whisper_forward == SYNC_STRATEGY.WHISPER
+                        end,
+                        callback = function()
+                            self.kosync_whisper_forward = SYNC_STRATEGY.WHISPER
+                        end,
+                    },
+                    {
+                        text = _("  Prompt to sync to latest record"),
+                        checked_func = function()
+                            return self.kosync_whisper_forward == SYNC_STRATEGY.PROMPT
+                        end,
+                        callback = function()
+                            self.kosync_whisper_forward = SYNC_STRATEGY.PROMPT
+                        end,
+                    },
+                    {
+                        text = _("  Disable to sync to latest record"),
+                        checked_func = function()
+                            return self.kosync_whisper_forward == SYNC_STRATEGY.DISABLE
+                        end,
+                        callback = function()
+                            self.kosync_whisper_forward = SYNC_STRATEGY.DISABLE
+                        end,
+                    },
+                    {
+                        text = "Sync to a previous record <<<<",
+                        enabled = false,
+                    },
+                    {
+                        text = _("  Auto sync to a previous record"),
+                        checked_func = function()
+                            return self.kosync_whisper_backward == SYNC_STRATEGY.WHISPER
+                        end,
+                        callback = function()
+                            self.kosync_whisper_backward = SYNC_STRATEGY.WHISPER
+                        end,
+                    },
+                    {
+                        text = _("  Prompt to sync to a previous record"),
+                        checked_func = function()
+                            return self.kosync_whisper_backward == SYNC_STRATEGY.PROMPT
+                        end,
+                        callback = function()
+                            self.kosync_whisper_backward = SYNC_STRATEGY.PROMPT
+                        end,
+                    },
+                    {
+                        text = _("  Disable to sync to a previous record"),
+                        checked_func = function()
+                            return self.kosync_whisper_backward == SYNC_STRATEGY.DISABLE
+                        end,
+                        callback = function()
+                            self.kosync_whisper_backward = SYNC_STRATEGY.DISABLE
+                        end,
+                    },
+                },
             },
             {
                 text = _("Push progress from this device"),
@@ -346,7 +432,7 @@ function KOSync:getProgress(manual)
             doc_digest,
             function(ok, body)
                 DEBUG("get progress for", self.view.document.file, ok, body)
-                if body then
+                if ok and body then
                     if body.percentage then
                         if body.device ~= DeviceModel
                         or body.device_id ~= self.kosync_device_id then
@@ -354,17 +440,52 @@ function KOSync:getProgress(manual)
                             local progress = self:getLastProgress()
                             local percentage = self:getLastPercent()
                             DEBUG("current progress", percentage)
-                            if body.percentage > percentage and body.progress ~= progress then
-                                UIManager:show(ConfirmBox:new{
-                                    text = T(_("Sync to furthest location read (%1%) from device '%2'?"),
-                                        Math.round(body.percentage*100), body.device),
-                                    ok_callback = function()
-                                        self:syncToProgress(body.progress)
-                                    end,
-                                })
+                            if percentage ~= body.percentage
+                            and body.progress ~= progress then
+                                -- The progress needs to be updated.
+                                local function show_synced_message()
+                                    UIManager:show(InfoMessage:new{
+                                        text = _("Progress has been synchronized."),
+                                        timeout = 3,
+                                    })
+                                end
+                                if manual then
+                                    self:syncToProgress(body.progress)
+                                    show_synced_message()
+                                else -- if not manual then
+                                    if body.timestamp > self.last_page_turn_ticks then
+                                        if self.kosync_whisper_forward == SYNC_STRATEGY.WHISPER then
+                                            self:syncToProgress(body.progress)
+                                            show_synced_message()
+                                        elseif self.kosync_whisper_forward == SYNC_STRATEGY.PROMPT then
+                                            UIManager:show(ConfirmBox:new{
+                                                text = T(_("Sync to the latest record %1% from device '%2'?"),
+                                                         Math.round(body.percentage * 100),
+                                                         body.device),
+                                                ok_callback = function()
+                                                    self:syncToProgress(body.progress)
+                                                end,
+                                            })
+                                        end
+                                    else -- if body.timestamp <= self.last_page_turn_ticks then
+                                        if self.kosync_whisper_backward == SYNC_STRATEGY.WHISPER then
+                                            self:syncToProgress(body.progress)
+                                            show_synced_message()
+                                        elseif self.kosync_whisper_backward == SYNC_STRATEGY.PROMPT then
+                                            UIManager:show(ConfirmBox:new{
+                                                text = T(_("Sync to a previous record %1% from device '%2'?"),
+                                                         Math.round(body.percentage * 100),
+                                                         body.device),
+                                                ok_callback = function()
+                                                    self:syncToProgress(body.progress)
+                                                end,
+                                            })
+                                        end
+                                    end
+                                end
                             elseif manual then
                                 UIManager:show(InfoMessage:new{
-                                    text = _("Already synchronized."),
+                                    text = _("The progress has already been synchronized."),
                                     timeout = 3,
                                 })
                             end
@@ -399,6 +520,14 @@ function KOSync:onSaveSettings()
         username = self.kosync_username,
         userkey = self.kosync_userkey,
         auto_sync = self.kosync_auto_sync,
+        whisper_forward =
+              (self.kosync_whisper_forward == SYNC_STRATEGY.DEFAULT_FORWARD
+               and nil
+               or self.kosync_whisper_forward),
+        whisper_backward =
+              (self.kosync_whisper_backward == SYNC_STRATEGY.DEFAULT_BACKWARD
+               and nil
+               or self.kosync_whisper_backward),
     }
     G_reader_settings:saveSetting("kosync", settings)
 end
@@ -407,6 +536,35 @@ function KOSync:onCloseDocument()
     DEBUG("on close document")
     if self.kosync_auto_sync then
         self:updateProgress()
+    end
+end
+
+function KOSync:_onPageUpdate(page)
+    if self.last_page == -1 then
+        self.last_page = page
+    elseif self.last_page ~= page then
+        self.last_page = page
+        self.last_page_turn_ticks = os.time()
+        self.page_update_times = self.page_update_times + 1
+        if DAUTO_SAVE_PAGING_COUNT <= 0
+        or self.page_update_times == DAUTO_SAVE_PAGING_COUNT then
+            self.page_update_times = 0
+            UIManager:scheduleIn(1, function() self:updateProgress() end)
+        end
+    end
+end
+
+function KOSync:_onResume()
+    UIManager:scheduleIn(1, function() self:getProgress() end)
+end
+
+function KOSync:registerEvents()
+    if self.kosync_auto_sync then
+        self.onPageUpdate = self._onPageUpdate
+        self.onResume = self._onResume
+    else
+        self.onPageUpdate = nil
+        self.onResume = nil
     end
 end
 

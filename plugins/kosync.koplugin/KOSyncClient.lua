@@ -15,6 +15,7 @@ function KOSyncClient:new(o)
 end
 
 function KOSyncClient:init()
+    require("socket.http").TIMEOUT = 1
     local Spore = require("Spore")
     self.client = Spore.new_from_spec(self.service_spec, {
         base_url = self.custom_url,
